@@ -1,0 +1,14 @@
+.DS_Store
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+.cxx/
+.externalNativeBuild/
+keystore/
+*.jks
+tools/.smsgw_token
+.smsgw_token
+
+.kotlin/

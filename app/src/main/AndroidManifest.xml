@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Delivered / failed notifications (mirrored to the computer by KDE Connect) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The phone's Wi-Fi address for `smsgw info` (granted automatically) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Optional: list the SIMs and choose one by slot -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Commands from adb and Termux: am broadcast -n com.r2r.smsgateway/.Api -a send ...
+             Every command must carry the access token shown in the app. -->
+        <receiver
+            android:name=".Api"
+            android:exported="true" />
+
+        <!-- Sent / delivered callbacks from the phone's SMS service (only this app can address it) -->
+        <receiver
+            android:name=".StatusReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

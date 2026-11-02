@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# SMS Gateway command-line helper; run `smsgw help` for the full description.
+
+set -euo pipefail
+
+COMPONENT="com.r2r.smsgateway/.Api"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # the folder this script is in
+
+help() {
+    cat <<'EOF'
+smsgw: send SMS through the SMS Gateway app and follow their delivery.
+Works on a computer (through adb) and in Termux on the phone.
+
+COMMANDS
+  send    --to <number> --text <message> [--id <ref>] [--slot <1|2> | --sub <id>]
+          Sends an SMS and asks the carrier for a delivery report.
+            --to     phone number, e.g. 0000000000 or +910000000000
+            --text   the message; long texts are sent in parts automatically
+            --id     your own reference: letters, digits, _ - . (max 64), each used only once, case is
+                     ignored. Left out, the gateway makes one up (e.g. M20261025-163646-123).
+            --slot   SIM slot to send from: 1 or 2
+            --sub    or the SIM's subscription id (both listed by `smsgw info`);
+                     neither given: the phone's default SIM for SMS
+          The same by position:  smsgw send <number> <message> [ref]
+
+  status  <id>   (or --id <id>)
+          Full JSON: status, times (from the carrier's report when it has them, otherwise the phone),
+          every part with its carrier reference, and the timeline.
+
+  watch   <id>   (or --id <id>)   [seconds]
+          Waits for the outcome, then prints the timeline. Gives up after [seconds] (default 300).
+
+  list    [--summary] [count]
+          The latest [count] messages (default 20) as JSON; with --summary one line per message:
+          number, id and message text.
+
+  info    [--json]
+          The phone (name, model, Android, Wi-Fi IP and, on a computer, the adb connection in use),
+          the app version, the setup checks (permissions, Autostart, battery) and the SIMs.
+          --json gives the raw reply for scripts.
+  help    This text (also -h, --help).
+
+CHOOSING THE PHONE (on a computer)
+  adb names every connected device by a serial: the first column of `adb devices`, for example
+      192.0.2.1:5555                          Wireless debugging, by IP address and port
+      adb-DEVICE._adb-tls-connect._tcp    the same phone, found by name on the network
+      emulator-5554                                an emulator
+  With one phone connected nothing is needed; a phone listed twice (by IP and by name) counts as one.
+  Otherwise pick it with --device before the command, or once for the session with SMSGW_DEVICE.
+  Besides the serial, the phone's model or name from `adb devices -l` is accepted:
+      smsgw --device 192.0.2.1:5555 info
+      smsgw --device DEVICE_SERIAL info
+      export SMSGW_DEVICE=DEVICE_SERIAL
+
+TOKEN
+  Every command needs the access token shown in the SMS Gateway app. It is read from $SMSGW_TOKEN,
+  else the file .smsgw_token in the same folder as this script, else ~/.smsgw_token.
+
+EXIT CODES
+  0 done (watch: delivered)   1 error, failed or unknown id   2 wrong usage   3 watch gave up waiting
+
+EXAMPLES
+  smsgw send --to 0000000000 --text "Hello" --id INV001
+  smsgw send --to 0000000000 --text "Sent from the BSNL SIM" --id INV002 --slot 2
+  smsgw watch INV001
+  smsgw list --summary 10
+EOF
+}
+
+usage() { echo "usage: $1   (smsgw help for details)" >&2; exit 2; }
+
+token() {
+    if [ -n "${SMSGW_TOKEN:-}" ]; then printf '%s' "$SMSGW_TOKEN"; return; fi
+    local f
+    for f in "$HERE/.smsgw_token" "$HOME/.smsgw_token"; do
+        if [ -f "$f" ]; then tr -d ' \r\n' < "$f"; return; fi
+    done
+    echo "smsgw: no token. Put it in $HERE/.smsgw_token (copy it from the SMS Gateway app)." >&2
+    exit 2
+}
+
+in_termux() { [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *com.termux* ]]; }
+
+# The adb serial to use: $SMSGW_DEVICE as a serial, or as a model / name from `adb devices -l`;
+# unset, the only phone (one listed twice, by IP and by name, is the same phone). Empty = let adb decide.
+pick_device() {
+    local list serials
+    list=$(adb devices -l 2>/dev/null | awk 'NR > 1 && $2 == "device"') || true
+    serials=$(printf '%s\n' "$list" | awk 'NF {print $1}')
+    if [ -n "${SMSGW_DEVICE:-}" ]; then
+        if printf '%s\n' "$serials" | grep -qxF "$SMSGW_DEVICE"; then printf '%s' "$SMSGW_DEVICE"; return; fi
+        local match
+        match=$(printf '%s\n' "$list" | awk -v k="$SMSGW_DEVICE" 'index(tolower($0), tolower(k)) {print $1; exit}')
+        if [ -n "$match" ]; then printf '%s' "$match"; return; fi
+        echo "smsgw: no connected device matches '$SMSGW_DEVICE'. Connected:" >&2
+        adb devices -l >&2
+        exit 1
+    fi
+    [ "$(printf '%s\n' "$serials" | grep -c .)" -le 1 ] && return
+    local models
+    models=$(printf '%s\n' "$list" | awk '{for (i = 3; i <= NF; i++) if ($i ~ /^model:/) print $i}' | sort -u)
+    if [ "$(printf '%s\n' "$models" | grep -c .)" -eq 1 ]; then printf '%s\n' "$serials" | head -1; return; fi
+    echo "smsgw: several devices are connected. Choose one with --device <serial or model>, e.g.:" >&2
+    printf '%s\n' "$list" | awk '{m = ""; for (i = 3; i <= NF; i++) if ($i ~ /^model:/) m = substr($i, 7); print "  smsgw --device " $1 "   (" m ")"}' >&2
+    exit 1
+}
+
+# Quote one argument for the phone's shell (adb shell joins its arguments into one command line).
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# call <command> [am extras...] -> prints the JSON reply; returns 1 if it says "ok":false
+call() {
+    local cmd="$1"; shift
+    local out tok
+    tok=$(token) || exit 2
+    if in_termux; then
+        # Termux's am does not wait for the reply, so SMS Gateway also writes it to a file we read back.
+        local rid="r$(date +%s)-$$-$RANDOM"
+        local f="${SMSGW_REPLY_DIR:-/storage/emulated/0/Download/SmsGateway/replies}/$rid.json" i
+        am broadcast -n "$COMPONENT" -a "$cmd" --es token "$tok" --es reply "$rid" "$@" >/dev/null 2>&1 || true
+        for i in $(seq 1 50); do [ -s "$f" ] && break; sleep 0.2; done
+        if [ ! -s "$f" ]; then
+            echo "smsgw: no reply within 10 s. Check the token, that SMS Gateway is version 1.0.2 or newer," >&2
+            echo "       and that termux-setup-storage was run (Termux must be able to read Download)." >&2
+            exit 1
+        fi
+        out=$(cat "$f")
+        rm -f "$f"
+        printf '%s\n' "$out"
+        case "$out" in *'"ok":false'*) return 1 ;; esac
+        return 0
+    fi
+    local args="" a
+    for a in "$@"; do args="$args $(q "$a")"; done
+    # "|| true": if adb itself fails (e.g. no device), show its message below instead of stopping silently.
+    out=$(adb ${DEVICE:+-s "$DEVICE"} shell "am broadcast -n $COMPONENT -a $cmd --es token $(q "$tok")$args" 2>&1) || true
+    local json
+    json=$(printf '%s\n' "$out" | sed -n 's/^Broadcast completed: result=[0-9-]*, data="\(.*\)"[[:space:]]*$/\1/p')
+    if [ -z "$json" ]; then
+        case "$out" in
+            *"no devices"*|*"not found"*|*offline*)
+                echo "smsgw: the phone is not connected to adb. Re-enable Wireless debugging (adb connect <IP:port>)." >&2 ;;
+            *"more than one device"*)
+                echo "smsgw: several devices are connected; choose one with --device (see smsgw help)." >&2 ;;
+            *) echo "smsgw: no reply from SMS Gateway (is it installed and opened once?). Output was:" >&2 ;;
+        esac
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+    printf '%s\n' "$json"
+    case "$json" in *'"ok":false'*) return 1 ;; esac
+}
+
+# Value of a key in the JSON reply (keys are unique in SMS Gateway replies); "\/" is unescaped to "/".
+field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1 | sed 's#\\/#/#g'; }
+
+# "list" reply -> one line per message: number, id, message text (JSON escapes undone, line breaks as spaces).
+summary() {
+    printf '%-16s %-24s %s\n' "NUMBER" "ID" "MESSAGE"
+    awk '{ gsub(/\{"id":/, "\n{\"id\":"); print }' | grep '^{"id":' | while IFS= read -r m; do
+        text=$(printf '%s' "$m" | sed -E 's/.*"text":"(([^"\\]|\\.)*)".*/\1/' \
+            | sed -e 's/\\"/"/g' -e 's#\\/#/#g' -e 's/\\n/ /g' -e 's/\\r//g' -e 's/\\t/ /g' -e 's/\\\\/\\/g')
+        printf '%-16s %-24s %s\n' "$(field "$m" to)" "$(field "$m" id)" "$text"
+    done
+}
+
+# "info" reply -> readable text. $2: the adb serial in use (empty in Termux).
+pretty_info() {
+    local j="$1" serial="$2"
+    tick() { case "$1" in true) printf '✓' ;; false) printf '✗' ;; *) printf '?' ;; esac; }
+    printf '%s\n\n' "$(field "$j" app)"
+    printf 'Phone\n'
+    printf '  %-16s %s\n' "Name" "$(field "$j" phoneName)"
+    printf '  %-16s %s %s  (device %s)\n' "Model" "$(field "$j" manufacturer)" "$(field "$j" model)" "$(field "$j" device)"
+    printf '  %-16s %s\n' "Android" "$(field "$j" android)"
+    local ip; ip=$(field "$j" wifiIp); [ "$ip" = null ] && ip="not on Wi-Fi"
+    printf '  %-16s %s\n' "Wi-Fi IP" "$ip"
+    if [ -z "$serial" ] && in_termux; then
+        printf '  %-16s %s\n' "Connected via" "Termux on this phone"
+    else
+        local addr=""
+        case "$serial" in
+            *.*.*.*:*) addr="$serial" ;;                                    # Wireless debugging by IP:port
+            *._adb-tls-connect._tcp)
+                # Found by name: ask adb's network discovery, else read adbd's listening port on the phone
+                # (the socket owned by the shell user, uid 2000) and pair it with the Wi-Fi IP.
+                addr=$(adb mdns services 2>/dev/null | awk -v n="${serial%%._adb-tls-connect._tcp}" '$1 == n {print $3; exit}')
+                if [ -z "$addr" ] && [ "$ip" != "not on Wi-Fi" ]; then
+                    local port
+                    port=$(adb -s "$serial" shell "cat /proc/net/tcp6 /proc/net/tcp 2>/dev/null" 2>/dev/null \
+                        | awk '$4 == "0A" && $8 == "2000" {split($2, a, ":"); print a[2]; exit}')
+                    [ -n "$port" ] && addr="$ip:$((16#$port))"
+                fi ;;
+            emulator-*) addr="emulator" ;;
+            ?*) addr="USB cable" ;;
+        esac
+        printf '  %-16s %s\n' "Connected via" "adb, serial $serial"
+        [ -n "$addr" ] && printf '  %-16s %s\n' "adb address" "$addr"
+    fi
+    printf '\nSetup\n'
+    printf '  %-16s %s\n' "SMS permission" "$(tick "$(field "$j" smsPermission)")"
+    printf '  %-16s %s\n' "Notifications" "$(tick "$(field "$j" notifications)")"
+    case "$j" in *'"sims":['*) printf '  %-16s ✓\n' "Phone permission" ;; *) printf '  %-16s ✗ (optional: SIM list and --slot)\n' "Phone permission" ;; esac
+    printf '  %-16s %s\n' "Autostart" "$(tick "$(field "$j" autostart)")"
+    printf '  %-16s %s\n' "Battery saver" "$(tick "$(field "$j" batteryUnrestricted)") No restrictions"
+    printf '\nSIMs\n'
+    case "$j" in
+        *'"sims":['*)
+            printf '%s' "$j" | awk '{ gsub(/\{"sub":/, "\n{\"sub\":"); print }' | grep '^{"sub":' | while IFS= read -r m; do
+                local note=""; [ "$(field "$m" smsDefault)" = true ] && note="default for SMS"
+                printf '  Slot %-3s %-16s %-14s sub %-4s %s\n' "$(field "$m" slot)" "$(field "$m" name)" "($(field "$m" carrier))" "$(field "$m" sub)" "$note"
+            done ;;
+        *) printf '  %s\n' "$(field "$j" sims)" ;;   # e.g. the Phone permission is missing
+    esac
+}
+
+# Options before the command: --device <serial or model> (computer only).
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --device|-d) SMSGW_DEVICE="${2:?--device needs a serial or model (see adb devices -l)}"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+command="${1:-help}"
+case "$command" in
+    help|-h|--help) help; exit 0 ;;
+    send|status|watch|list|info) ;;
+    *) echo "smsgw: unknown command '$command'" >&2; echo >&2; help >&2; exit 2 ;;
+esac
+DEVICE=""
+if ! in_termux; then
+    if ! command -v adb >/dev/null 2>&1; then
+        echo "smsgw: adb not found. Add Android's platform-tools to PATH, e.g.:" >&2
+        echo '       export PATH="$HOME/Library/Android/sdk/platform-tools:$PATH"' >&2
+        exit 1
+    fi
+    DEVICE=$(pick_device)
+fi
+
+case "$command" in
+    send)
+        shift
+        sim=(); to=""; text=""; id=""; pos=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --to) to="${2:?--to needs a phone number}"; shift 2 ;;
+                --text) text="${2:?--text needs the message}"; shift 2 ;;
+                --id) id="${2:?--id needs a reference}"; shift 2 ;;
+                --slot) sim=(--ei slot "${2:?--slot needs 1 or 2}"); shift 2 ;;
+                --sub) sim=(--ei sub "${2:?--sub needs a subscription id}"); shift 2 ;;
+                --*) echo "smsgw: unknown option $1" >&2; exit 2 ;;
+                *) pos+=("$1"); shift ;;
+            esac
+        done
+        # Values given by position fill whatever the named options did not: number, message, reference.
+        i=0
+        if [ -z "$to" ] && [ $i -lt ${#pos[@]} ]; then to="${pos[$i]}"; i=$((i + 1)); fi
+        if [ -z "$text" ] && [ $i -lt ${#pos[@]} ]; then text="${pos[$i]}"; i=$((i + 1)); fi
+        if [ -z "$id" ] && [ $i -lt ${#pos[@]} ]; then id="${pos[$i]}"; i=$((i + 1)); fi
+        if [ $i -lt ${#pos[@]} ] || [ -z "$to" ] || [ -z "$text" ]; then
+            usage "smsgw send --to <number> --text <message> [--id <ref>] [--slot N | --sub N]"
+        fi
+        args=(--es to "$to" --es text "$text")
+        [ -n "$id" ] && args+=(--es id "$id")
+        call send "${args[@]}" ${sim[@]+"${sim[@]}"}
+        ;;
+    status)
+        [ "${2:-}" = "--id" ] && set -- "$1" "${3:-}" "${@:4}"
+        [ -n "${2:-}" ] || usage "smsgw status <id>"
+        call status --es id "$2"
+        ;;
+    watch)
+        [ "${2:-}" = "--id" ] && set -- "$1" "${3:-}" "${@:4}"
+        [ -n "${2:-}" ] || usage "smsgw watch <id> [seconds]"
+        # While waiting, progress is shown without times; at the end the timeline is printed, every time
+        # taken from the carrier's report when it has one, otherwise from the phone.
+        id="$2"; limit="${3:-300}"; last=""; start=$(date +%s)
+        while :; do
+            if ! reply=$(call status --es id "$id"); then
+                echo "smsgw: $(field "$reply" error)" >&2   # e.g. no message with that id
+                exit 1
+            fi
+            state=$(field "$reply" status)
+            id=$(field "$reply" id)   # as stored (ids are matched ignoring case)
+            case "$state" in
+                DELIVERED|FAILED)
+                    field "$reply" timeline | tr ';' '\n'; echo
+                    if [ "$state" = DELIVERED ]; then exit 0; else exit 1; fi
+                    ;;
+            esac
+            parts=$(field "$reply" parts)
+            now="... $id $state"
+            [ "${parts:-1}" -gt 1 ] && now="$now (parts sent $(field "$reply" partsSent)/$parts, delivered $(field "$reply" partsDelivered)/$parts)"
+            if [ "$now" != "$last" ]; then echo "$now"; last="$now"; fi
+            if [ $(( $(date +%s) - start )) -ge "$limit" ]; then
+                field "$reply" timeline | tr ';' '\n'; echo
+                echo "smsgw: still $state after ${limit}s (no delivery report yet)" >&2
+                exit 3
+            fi
+            sleep 1
+        done
+        ;;
+    list)
+        shift
+        brief=no; count=20
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --summary) brief=yes; shift ;;
+                [0-9]*) count="$1"; shift ;;
+                *) usage "smsgw list [--summary] [count]" ;;
+            esac
+        done
+        if [ "$brief" = yes ]; then
+            reply=$(call list --ei limit "$count") || { printf '%s\n' "$reply"; exit 1; }
+            printf '%s\n' "$reply" | summary
+        else
+            call list --ei limit "$count"
+        fi
+        ;;
+    info)
+        if [ "${2:-}" = "--json" ]; then call info; exit $?; fi
+        reply=$(call info) || { printf '%s\n' "$reply"; exit 1; }
+        serial="$DEVICE"
+        in_termux || [ -n "$serial" ] || serial=$(adb devices | awk 'NR > 1 && $2 == "device" {print $1; exit}')
+        pretty_info "$reply" "$serial"
+        ;;
+esac
